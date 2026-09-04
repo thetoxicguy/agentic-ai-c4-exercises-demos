@@ -805,13 +805,188 @@ def financial_health_check(as_of_date: str) -> str:
 
 # Set up your agents and create an orchestration agent that will manage them.
 
+inventory_agent = ToolCallingAgent(
+    tools=[
+        check_all_inventory,
+        check_item_stock,
+        estimate_supplier_delivery,
+        reorder_stock,
+        check_company_cash_balance,
+    ],
+    model=model,
+    name="inventory_agent",
+    description=f"""
+    You are the Inventory Agent for Beaver's Choice Paper Company.
+    You answer questions about current stock levels, estimate supplier delivery
+    timelines, and place restock orders (only if the cash balance can cover the cost).
+
+    Our paper supply catalog (use these EXACT item names):
+    {CATALOG_TEXT}
+    """,
+)
+
+quoting_agent = ToolCallingAgent(
+    tools=[find_similar_quotes, check_item_stock],
+    model=model,
+    name="quoting_agent",
+    description=f"""
+    You are the Quoting Agent for Beaver's Choice Paper Company.
+    Given a customer's itemized request, you produce a fair price quote:
+    1. Map each requested item to the closest EXACT catalog item name below. If an
+       item has no reasonable match in our catalog, say so explicitly.
+    2. Use find_similar_quotes to see how comparable past orders (by job type,
+       order size, event type) were priced and discounted.
+    3. Price each line item at its catalog unit price, then apply a bulk discount
+       for large quantities (roughly 10% off for orders of 300+ units of an item,
+       15% for 1000+), matching the style of past quotes.
+    4. Return a clear total price and a short, customer-friendly explanation of
+       how it was calculated. Never reveal exact profit margins.
+
+    Our paper supply catalog (use these EXACT item names):
+    {CATALOG_TEXT}
+    """,
+)
+
+sales_agent = ToolCallingAgent(
+    tools=[
+        check_stock_for_order,
+        check_delivery_feasible,
+        finalize_sale,
+        check_company_cash_balance,
+        financial_health_check,
+    ],
+    model=model,
+    name="sales_agent",
+    description="""
+    You are the Sales/Fulfillment Agent for Beaver's Choice Paper Company.
+    Given a quoted order with a requested delivery date, you decide whether to
+    finalize or reject it:
+    1. For each item, use check_stock_for_order to confirm enough stock exists.
+    2. Use check_delivery_feasible to confirm the supplier can deliver in time.
+    3. For large orders, run financial_health_check first as a sanity check.
+    4. If everything checks out, use finalize_sale to record the sale for each
+       item and confirm the order to the customer.
+    5. If stock is insufficient or the delivery deadline can't be met, do NOT
+       finalize the sale - clearly and politely tell the customer which item(s)
+       could not be fulfilled and why (insufficient stock or delivery timeline).
+    Never reveal internal cash balances or profit margins to the customer.
+    """,
+)
+
+
+class Orchestrator(ToolCallingAgent):
+    """Top-level agent that routes a customer request through inventory, quoting, and sales."""
+
+    def __init__(self, model: OpenAIServerModel):
+        self.model = model
+        self.inventory_agent = inventory_agent
+        self.quoting_agent = quoting_agent
+        self.sales_agent = sales_agent
+
+        @tool
+        def ask_inventory_agent(query: str) -> str:
+            """Delegate an inventory-related question to the Inventory Agent.
+
+            Args:
+                query: The question or task for the Inventory Agent.
+
+            Returns:
+                The Inventory Agent's response.
+            """
+            return self.inventory_agent.run(query)
+
+        @tool
+        def ask_quoting_agent(query: str) -> str:
+            """Delegate a pricing/quoting task to the Quoting Agent.
+
+            Args:
+                query: The itemized request or pricing question for the Quoting Agent.
+
+            Returns:
+                The Quoting Agent's response, including the proposed price and explanation.
+            """
+            return self.quoting_agent.run(query)
+
+        @tool
+        def ask_sales_agent(query: str) -> str:
+            """Delegate an order finalization task to the Sales Agent.
+
+            Args:
+                query: The quoted order details, including items, quantities, price,
+                    the request date, and any delivery deadline.
+
+            Returns:
+                The Sales Agent's response confirming or rejecting the order.
+            """
+            return self.sales_agent.run(query)
+
+        super().__init__(
+            tools=[ask_inventory_agent, ask_quoting_agent, ask_sales_agent],
+            model=model,
+            name="orchestrator",
+            description=f"""
+            You are the Orchestrator for Beaver's Choice Paper Company's ordering system.
+            For each customer request (which includes the request date), follow this workflow:
+            1. Identify the itemized list of products and quantities the customer wants,
+               mapping each to an EXACT catalog item name (below). Note any items that
+               don't reasonably match anything in our catalog.
+            2. Use ask_quoting_agent to get a price quote for the matched items.
+            3. Use ask_sales_agent to check stock and delivery feasibility and finalize
+               (or reject) the order, passing along the request date and any delivery
+               deadline mentioned by the customer.
+            4. Use ask_inventory_agent only if you need to check stock/inventory
+               yourself before deciding how to route the request.
+            5. Reply to the customer in ONE clear final message: state what will be
+               fulfilled, the price, the delivery estimate, and a plain-language reason
+               for anything that could not be fulfilled (e.g. insufficient stock, an
+               item we don't carry, or a delivery deadline we can't meet). Never reveal
+               internal cash balances, profit margins, or raw system errors.
+
+            Our paper supply catalog (use these EXACT item names):
+            {CATALOG_TEXT}
+            """,
+        )
+
+    def handle_customer_request(self, request_text: str) -> str:
+        """Process a single customer request end-to-end and return the customer-facing reply.
+
+        Args:
+            request_text: The customer's free-text request, including the request date.
+
+        Returns:
+            The final text response to send back to the customer.
+        """
+        try:
+            return self.run(request_text)
+        except Exception as exc:
+            print(f"Error handling request: {exc}")
+            return (
+                "We're sorry, we were unable to process your request due to an "
+                "internal issue. Please contact us directly so we can assist you."
+            )
+
+
+orchestrator = Orchestrator(model)
+
+
+def call_your_multi_agent_system(request_text: str) -> str:
+    """Entry point used by the evaluation harness to process one customer request.
+
+    Args:
+        request_text: The customer's free-text request, including the request date.
+
+    Returns:
+        The final text response to send back to the customer.
+    """
+    return orchestrator.handle_customer_request(request_text)
+
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -858,7 +1033,7 @@ def run_test_scenarios():
         ############
         ############
 
-        # response = call_your_multi_agent_system(request_with_date)
+        response = call_your_multi_agent_system(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
