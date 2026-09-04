@@ -690,13 +690,22 @@ def check_all_inventory(as_of_date: str) -> str:
 def check_item_stock(item_name: str, as_of_date: str) -> str:
     """Check the current stock level of a single specific item.
 
+    item_name MUST be an exact catalog name (call match_catalog_item first if
+    you're not certain of the exact name).
+
     Args:
         item_name: The exact catalog item name to check.
         as_of_date: ISO-formatted date (YYYY-MM-DD) to check stock as of.
 
     Returns:
-        A string reporting the current stock quantity for that item.
+        A string reporting the current stock quantity for that item, or an error
+        if item_name is not an exact catalog name.
     """
+    if item_name not in CATALOG_PRICES:
+        return (
+            f"Unknown item '{item_name}': not an exact catalog item name. "
+            "Use match_catalog_item to find the correct name first."
+        )
     result = get_stock_level(item_name, as_of_date)
     stock = int(result.iloc[0]["current_stock"])
     return f"{item_name}: {stock} units in stock as of {as_of_date}."
@@ -717,21 +726,28 @@ def estimate_supplier_delivery(order_date: str, quantity: int) -> str:
 
 
 @tool
-def reorder_stock(item_name: str, quantity: int, unit_price: float, order_date: str) -> str:
+def reorder_stock(item_name: str, quantity: int, order_date: str) -> str:
     """Place a restock order with the supplier if the company can afford it.
 
-    Records a 'stock_orders' transaction after verifying the current cash balance
-    covers the cost of the restock.
+    Records a 'stock_orders' transaction at the catalog unit price, after verifying
+    the current cash balance covers the cost. item_name MUST be an exact catalog
+    name (call match_catalog_item first if you're not certain of the exact name).
 
     Args:
         item_name: The exact catalog item name to reorder.
         quantity: Number of units to reorder.
-        unit_price: The per-unit cost of the item.
         order_date: ISO-formatted date (YYYY-MM-DD) the order is placed.
 
     Returns:
-        A confirmation message, or an explanation if funds are insufficient.
+        A confirmation message, or an explanation if the item name is unknown or
+        funds are insufficient.
     """
+    if item_name not in CATALOG_PRICES:
+        return (
+            f"Cannot reorder '{item_name}': not an exact catalog item name. "
+            "Use match_catalog_item to find the correct name first."
+        )
+    unit_price = CATALOG_PRICES[item_name]
     cost = round(quantity * unit_price, 2)
     cash = get_cash_balance(order_date)
     if cost > cash:
@@ -776,14 +792,23 @@ def find_similar_quotes(search_terms: List[str], limit: int = 5) -> str:
 def check_stock_for_order(item_name: str, quantity: int, as_of_date: str) -> str:
     """Check whether enough stock exists for a requested item and quantity.
 
+    item_name MUST be an exact catalog name (call match_catalog_item first if
+    you're not certain of the exact name).
+
     Args:
         item_name: The exact catalog item name being ordered.
         quantity: The quantity requested by the customer.
         as_of_date: ISO-formatted date (YYYY-MM-DD) to check stock as of.
 
     Returns:
-        A message stating whether the requested quantity is available.
+        A message stating whether the requested quantity is available, or an
+        error if item_name is not an exact catalog name.
     """
+    if item_name not in CATALOG_PRICES:
+        return (
+            f"Unknown item '{item_name}': not an exact catalog item name. "
+            "Use match_catalog_item to find the correct name first."
+        )
     result = get_stock_level(item_name, as_of_date)
     stock = int(result.iloc[0]["current_stock"])
     if stock >= quantity:
@@ -813,6 +838,9 @@ def check_delivery_feasible(order_date: str, quantity: int, needed_by_date: str)
 def finalize_sale(item_name: str, quantity: int, total_price: float, sale_date: str) -> str:
     """Record a finalized sale transaction for a single item.
 
+    item_name MUST be an exact catalog name, copied verbatim from a prior
+    match_catalog_item or check_stock_for_order call - do not paraphrase it.
+
     Args:
         item_name: The exact catalog item name sold.
         quantity: Number of units sold.
@@ -820,8 +848,14 @@ def finalize_sale(item_name: str, quantity: int, total_price: float, sale_date: 
         sale_date: ISO-formatted date (YYYY-MM-DD) of the sale.
 
     Returns:
-        A confirmation message including the new transaction ID.
+        A confirmation message including the new transaction ID, or an error if
+        item_name is not an exact catalog name.
     """
+    if item_name not in CATALOG_PRICES:
+        return (
+            f"Cannot finalize sale of '{item_name}': not an exact catalog item "
+            "name. Use match_catalog_item to find the correct name first."
+        )
     transaction_id = create_transaction(item_name, "sales", quantity, total_price, sale_date)
     return f"Sale recorded (transaction #{transaction_id}): {quantity} units of {item_name} for ${total_price:.2f}."
 
@@ -861,6 +895,7 @@ def financial_health_check(as_of_date: str) -> str:
 
 inventory_agent = ToolCallingAgent(
     tools=[
+        match_catalog_item,
         check_all_inventory,
         check_item_stock,
         estimate_supplier_delivery,
@@ -873,6 +908,11 @@ inventory_agent = ToolCallingAgent(
     You are the Inventory Agent for Beaver's Choice Paper Company.
     You answer questions about current stock levels, estimate supplier delivery
     timelines, and place restock orders (only if the cash balance can cover the cost).
+
+    Before calling check_item_stock or reorder_stock for a specific item, always
+    call match_catalog_item first to get its exact catalog name - never invent,
+    guess, or paraphrase an item name yourself. reorder_stock looks up the price
+    from our catalog automatically; you do not supply a price.
 
     If the query states "Request date: YYYY-MM-DD", ALWAYS use exactly that date
     as as_of_date / order_date - never today's real-world date or a guessed date.
@@ -909,6 +949,7 @@ quoting_agent = ToolCallingAgent(
 
 sales_agent = ToolCallingAgent(
     tools=[
+        match_catalog_item,
         check_stock_for_order,
         check_delivery_feasible,
         finalize_sale,
@@ -919,14 +960,18 @@ sales_agent = ToolCallingAgent(
     name="sales_agent",
     description="""
     You are the Sales/Fulfillment Agent for Beaver's Choice Paper Company.
-    Given a quoted order (with exact catalog item names already chosen for you),
-    you decide whether to finalize or reject it:
-    1. For each item, use check_stock_for_order to confirm enough stock exists.
-    2. Use check_delivery_feasible to confirm the supplier can deliver in time.
-    3. For large orders, run financial_health_check first as a sanity check.
-    4. If everything checks out, use finalize_sale to record the sale for each
+    Given a quoted order, you decide whether to finalize or reject it:
+    1. For EVERY item, call match_catalog_item first to get its exact catalog
+       name - even if the query already looks like a catalog name, confirm it
+       this way. Copy that exact returned name verbatim into every later tool
+       call for that item; never paraphrase, shorten, or re-describe it (e.g.
+       do not turn "Glossy paper" into "high-quality glossy paper").
+    2. Use check_stock_for_order to confirm enough stock exists.
+    3. Use check_delivery_feasible to confirm the supplier can deliver in time.
+    4. For large orders, run financial_health_check first as a sanity check.
+    5. If everything checks out, use finalize_sale to record the sale for each
        item and confirm the order to the customer.
-    5. If stock is insufficient or the delivery deadline can't be met, do NOT
+    6. If stock is insufficient or the delivery deadline can't be met, do NOT
        finalize the sale - clearly and politely tell the customer which item(s)
        could not be fulfilled and why (insufficient stock or delivery timeline).
     Never reveal internal cash balances or profit margins to the customer.
@@ -934,8 +979,7 @@ sales_agent = ToolCallingAgent(
     The query you receive will explicitly state "Request date: YYYY-MM-DD" and,
     when relevant, "Needed by: YYYY-MM-DD". ALWAYS use exactly those dates as
     as_of_date / order_date / needed_by_date in your tool calls - never use
-    today's real-world date or invent one. Trust the item names given to you
-    exactly as written; do not modify them.
+    today's real-world date or invent one.
     """,
 )
 
