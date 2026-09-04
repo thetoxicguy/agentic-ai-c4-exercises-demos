@@ -588,15 +588,105 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 ########################
 
+from smolagents import ToolCallingAgent, OpenAIServerModel, tool
 
 # Set up and load your env parameters and instantiate your model.
 
+dotenv.load_dotenv()
+
+MODEL_ID = "gpt-4o-mini"
+
+model = OpenAIServerModel(
+    model_id=MODEL_ID,
+    api_base=os.getenv("OPENAI_BASE_URL"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+
+# Catalog text embedded into agent prompts so free-text customer requests get mapped
+# to the *exact* item names required by create_transaction / get_stock_level.
+CATALOG_TEXT = "\n".join(
+    f"- {item['item_name']} (${item['unit_price']:.2f} per unit, category: {item['category']})"
+    for item in paper_supplies
+)
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
 
 # Tools for inventory agent
+
+@tool
+def check_all_inventory(as_of_date: str) -> str:
+    """Get a snapshot of every item currently in stock as of a given date.
+
+    Args:
+        as_of_date: ISO-formatted date (YYYY-MM-DD) to check inventory as of.
+
+    Returns:
+        A formatted string listing each in-stock item and its current quantity.
+    """
+    inventory = get_all_inventory(as_of_date)
+    if not inventory:
+        return "No items are currently in stock."
+    lines = [f"{name}: {qty} units" for name, qty in sorted(inventory.items())]
+    return "Current inventory:\n" + "\n".join(lines)
+
+
+@tool
+def check_item_stock(item_name: str, as_of_date: str) -> str:
+    """Check the current stock level of a single specific item.
+
+    Args:
+        item_name: The exact catalog item name to check.
+        as_of_date: ISO-formatted date (YYYY-MM-DD) to check stock as of.
+
+    Returns:
+        A string reporting the current stock quantity for that item.
+    """
+    result = get_stock_level(item_name, as_of_date)
+    stock = int(result.iloc[0]["current_stock"])
+    return f"{item_name}: {stock} units in stock as of {as_of_date}."
+
+
+@tool
+def estimate_supplier_delivery(order_date: str, quantity: int) -> str:
+    """Estimate the delivery date from the supplier for a restock order.
+
+    Args:
+        order_date: ISO-formatted date (YYYY-MM-DD) the restock order is placed.
+        quantity: Number of units being ordered from the supplier.
+
+    Returns:
+        The estimated delivery date in ISO format (YYYY-MM-DD).
+    """
+    return get_supplier_delivery_date(order_date, quantity)
+
+
+@tool
+def reorder_stock(item_name: str, quantity: int, unit_price: float, order_date: str) -> str:
+    """Place a restock order with the supplier if the company can afford it.
+
+    Records a 'stock_orders' transaction after verifying the current cash balance
+    covers the cost of the restock.
+
+    Args:
+        item_name: The exact catalog item name to reorder.
+        quantity: Number of units to reorder.
+        unit_price: The per-unit cost of the item.
+        order_date: ISO-formatted date (YYYY-MM-DD) the order is placed.
+
+    Returns:
+        A confirmation message, or an explanation if funds are insufficient.
+    """
+    cost = round(quantity * unit_price, 2)
+    cash = get_cash_balance(order_date)
+    if cost > cash:
+        return (
+            f"Cannot reorder {quantity} units of {item_name}: cost ${cost:.2f} "
+            f"exceeds available cash balance ${cash:.2f}."
+        )
+    create_transaction(item_name, "stock_orders", quantity, cost, order_date)
+    return f"Reordered {quantity} units of {item_name} for ${cost:.2f} on {order_date}."
 
 
 # Tools for quoting agent
