@@ -718,6 +718,90 @@ def find_similar_quotes(search_terms: List[str], limit: int = 5) -> str:
 
 # Tools for ordering agent
 
+@tool
+def check_stock_for_order(item_name: str, quantity: int, as_of_date: str) -> str:
+    """Check whether enough stock exists for a requested item and quantity.
+
+    Args:
+        item_name: The exact catalog item name being ordered.
+        quantity: The quantity requested by the customer.
+        as_of_date: ISO-formatted date (YYYY-MM-DD) to check stock as of.
+
+    Returns:
+        A message stating whether the requested quantity is available.
+    """
+    result = get_stock_level(item_name, as_of_date)
+    stock = int(result.iloc[0]["current_stock"])
+    if stock >= quantity:
+        return f"OK: {item_name} has {stock} units in stock, enough for {quantity} requested."
+    return f"INSUFFICIENT: {item_name} has only {stock} units in stock, but {quantity} were requested."
+
+
+@tool
+def check_delivery_feasible(order_date: str, quantity: int, needed_by_date: str) -> str:
+    """Check whether the supplier can deliver an order in time to meet the customer's deadline.
+
+    Args:
+        order_date: ISO-formatted date (YYYY-MM-DD) the order would be placed.
+        quantity: Total quantity being ordered (drives supplier lead time).
+        needed_by_date: ISO-formatted date (YYYY-MM-DD) the customer needs delivery by.
+
+    Returns:
+        A message stating whether the estimated delivery date meets the deadline.
+    """
+    estimated = get_supplier_delivery_date(order_date, quantity)
+    if estimated <= needed_by_date:
+        return f"OK: estimated delivery {estimated} meets the required date {needed_by_date}."
+    return f"LATE: estimated delivery {estimated} is after the required date {needed_by_date}."
+
+
+@tool
+def finalize_sale(item_name: str, quantity: int, total_price: float, sale_date: str) -> str:
+    """Record a finalized sale transaction for a single item.
+
+    Args:
+        item_name: The exact catalog item name sold.
+        quantity: Number of units sold.
+        total_price: Total price charged for this line item.
+        sale_date: ISO-formatted date (YYYY-MM-DD) of the sale.
+
+    Returns:
+        A confirmation message including the new transaction ID.
+    """
+    transaction_id = create_transaction(item_name, "sales", quantity, total_price, sale_date)
+    return f"Sale recorded (transaction #{transaction_id}): {quantity} units of {item_name} for ${total_price:.2f}."
+
+
+@tool
+def check_company_cash_balance(as_of_date: str) -> str:
+    """Check the company's current cash balance.
+
+    Args:
+        as_of_date: ISO-formatted date (YYYY-MM-DD) to check the balance as of.
+
+    Returns:
+        The current cash balance as a formatted string.
+    """
+    return f"Cash balance as of {as_of_date}: ${get_cash_balance(as_of_date):.2f}"
+
+
+@tool
+def financial_health_check(as_of_date: str) -> str:
+    """Run a full financial health check, used as a sanity check before fulfilling large orders.
+
+    Args:
+        as_of_date: ISO-formatted date (YYYY-MM-DD) for the report.
+
+    Returns:
+        A summary of cash balance, inventory value, and total assets.
+    """
+    report = generate_financial_report(as_of_date)
+    return (
+        f"Cash: ${report['cash_balance']:.2f}, "
+        f"Inventory value: ${report['inventory_value']:.2f}, "
+        f"Total assets: ${report['total_assets']:.2f}"
+    )
+
 
 # Set up your agents and create an orchestration agent that will manage them.
 
