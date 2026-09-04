@@ -4,6 +4,7 @@ import os
 import time
 import dotenv
 import ast
+import re
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
@@ -609,8 +610,61 @@ CATALOG_TEXT = "\n".join(
     for item in paper_supplies
 )
 
+CATALOG_NAMES = [item["item_name"] for item in paper_supplies]
+CATALOG_PRICES = {item["item_name"]: item["unit_price"] for item in paper_supplies}
+
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
+
+
+# Shared tool: deterministic catalog matching (used by multiple agents, not a
+# database helper - just fuzzy string matching to avoid item-name hallucination)
+
+_MATCH_STOPWORDS = {
+    "of", "the", "a", "an", "for", "sheets", "sheet", "reams", "ream", "rolls",
+    "roll", "boxes", "box", "units", "unit", "pieces", "piece", "pack", "packs",
+    "various", "colors", "color", "high", "quality", "and",
+}
+
+
+def _catalog_words(text: str) -> set:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in tokens if t not in _MATCH_STOPWORDS and not t.isdigit()}
+
+
+def _catalog_match_score(description: str, catalog_name: str) -> float:
+    d, n = description.lower(), catalog_name.lower()
+    if n in d or d in n:
+        return 1.0
+    dw, nw = _catalog_words(description), _catalog_words(catalog_name)
+    if not dw or not nw:
+        return 0.0
+    return len(dw & nw) / len(dw | nw)
+
+
+@tool
+def match_catalog_item(description: str) -> str:
+    """Match a customer's free-text item description to the closest exact catalog item name.
+
+    Always use this instead of guessing or combining words yourself - item names
+    passed to other tools MUST come from this function's output, copied exactly.
+
+    Args:
+        description: The customer's wording for the item (e.g. "A4 glossy paper").
+
+    Returns:
+        "MATCH: <exact catalog name> ($<unit_price> per unit)" if a close match is
+        found, otherwise "NO_MATCH: <description>" if nothing in our catalog is close
+        enough - in that case, tell the customer we don't carry that item.
+    """
+    best_name, best_score = None, 0.0
+    for name in CATALOG_NAMES:
+        s = _catalog_match_score(description, name)
+        if s > best_score:
+            best_name, best_score = name, s
+    if best_name is None or best_score < 0.5:
+        return f"NO_MATCH: {description}"
+    return f"MATCH: {best_name} (${CATALOG_PRICES[best_name]:.2f} per unit)"
 
 
 # Tools for inventory agent
@@ -820,20 +874,25 @@ inventory_agent = ToolCallingAgent(
     You answer questions about current stock levels, estimate supplier delivery
     timelines, and place restock orders (only if the cash balance can cover the cost).
 
+    If the query states "Request date: YYYY-MM-DD", ALWAYS use exactly that date
+    as as_of_date / order_date - never today's real-world date or a guessed date.
+
     Our paper supply catalog (use these EXACT item names):
     {CATALOG_TEXT}
     """,
 )
 
 quoting_agent = ToolCallingAgent(
-    tools=[find_similar_quotes, check_item_stock],
+    tools=[match_catalog_item, find_similar_quotes, check_item_stock],
     model=model,
     name="quoting_agent",
-    description=f"""
+    description="""
     You are the Quoting Agent for Beaver's Choice Paper Company.
     Given a customer's itemized request, you produce a fair price quote:
-    1. Map each requested item to the closest EXACT catalog item name below. If an
-       item has no reasonable match in our catalog, say so explicitly.
+    1. For EVERY requested item, call match_catalog_item with the customer's wording
+       to get the exact catalog name. Only use item names that come from a MATCH
+       result - never invent, combine, or guess an item name yourself. If a tool
+       returns NO_MATCH, say plainly that we don't carry that item.
     2. Use find_similar_quotes to see how comparable past orders (by job type,
        order size, event type) were priced and discounted.
     3. Price each line item at its catalog unit price, then apply a bulk discount
@@ -842,8 +901,9 @@ quoting_agent = ToolCallingAgent(
     4. Return a clear total price and a short, customer-friendly explanation of
        how it was calculated. Never reveal exact profit margins.
 
-    Our paper supply catalog (use these EXACT item names):
-    {CATALOG_TEXT}
+    The query you receive will explicitly state "Request date: YYYY-MM-DD". If you
+    need current stock via check_item_stock, always use exactly that date as
+    as_of_date - never today's real-world date or a guessed date.
     """,
 )
 
@@ -859,8 +919,8 @@ sales_agent = ToolCallingAgent(
     name="sales_agent",
     description="""
     You are the Sales/Fulfillment Agent for Beaver's Choice Paper Company.
-    Given a quoted order with a requested delivery date, you decide whether to
-    finalize or reject it:
+    Given a quoted order (with exact catalog item names already chosen for you),
+    you decide whether to finalize or reject it:
     1. For each item, use check_stock_for_order to confirm enough stock exists.
     2. Use check_delivery_feasible to confirm the supplier can deliver in time.
     3. For large orders, run financial_health_check first as a sanity check.
@@ -870,6 +930,12 @@ sales_agent = ToolCallingAgent(
        finalize the sale - clearly and politely tell the customer which item(s)
        could not be fulfilled and why (insufficient stock or delivery timeline).
     Never reveal internal cash balances or profit margins to the customer.
+
+    The query you receive will explicitly state "Request date: YYYY-MM-DD" and,
+    when relevant, "Needed by: YYYY-MM-DD". ALWAYS use exactly those dates as
+    as_of_date / order_date / needed_by_date in your tool calls - never use
+    today's real-world date or invent one. Trust the item names given to you
+    exactly as written; do not modify them.
     """,
 )
 
@@ -921,26 +987,42 @@ class Orchestrator(ToolCallingAgent):
             return self.sales_agent.run(query)
 
         super().__init__(
-            tools=[ask_inventory_agent, ask_quoting_agent, ask_sales_agent],
+            tools=[match_catalog_item, ask_inventory_agent, ask_quoting_agent, ask_sales_agent],
             model=model,
             name="orchestrator",
             description=f"""
             You are the Orchestrator for Beaver's Choice Paper Company's ordering system.
-            For each customer request (which includes the request date), follow this workflow:
-            1. Identify the itemized list of products and quantities the customer wants,
-               mapping each to an EXACT catalog item name (below). Note any items that
-               don't reasonably match anything in our catalog.
-            2. Use ask_quoting_agent to get a price quote for the matched items.
-            3. Use ask_sales_agent to check stock and delivery feasibility and finalize
-               (or reject) the order, passing along the request date and any delivery
-               deadline mentioned by the customer.
-            4. Use ask_inventory_agent only if you need to check stock/inventory
-               yourself before deciding how to route the request.
-            5. Reply to the customer in ONE clear final message: state what will be
+            The customer request you receive ends with a literal marker
+            "(Date of request: YYYY-MM-DD)" - this is the REQUEST DATE. Follow this
+            workflow exactly:
+
+            1. Extract the REQUEST DATE from that marker. Also look for any delivery
+               deadline the customer mentions in their own words (e.g. "by April 15,
+               2025") and convert it to YYYY-MM-DD as the NEEDED-BY DATE; if none is
+               stated, use the REQUEST DATE as the NEEDED-BY DATE too.
+            2. For EVERY requested item, call match_catalog_item with the customer's
+               wording to get its exact catalog name and quantity. Never invent, combine,
+               or guess an item name yourself - only use names returned as a MATCH. Items
+               that come back NO_MATCH are not something we carry.
+            3. Call ask_quoting_agent with a plain-text message that explicitly states,
+               on its own line, "Request date: <REQUEST DATE>", followed by the matched
+               items and quantities, to get a price quote.
+            4. Call ask_sales_agent with a plain-text message that explicitly states, on
+               their own lines, "Request date: <REQUEST DATE>" and
+               "Needed by: <NEEDED-BY DATE>", followed by the matched items, quantities,
+               and the quoted total, so it can check stock/delivery and finalize or
+               reject the order.
+            5. Use ask_inventory_agent only if you need to check stock/inventory
+               yourself before deciding how to route the request (also state the
+               "Request date: <REQUEST DATE>" line in that call too).
+            6. Reply to the customer in ONE clear final message: state what will be
                fulfilled, the price, the delivery estimate, and a plain-language reason
                for anything that could not be fulfilled (e.g. insufficient stock, an
                item we don't carry, or a delivery deadline we can't meet). Never reveal
                internal cash balances, profit margins, or raw system errors.
+
+            ALWAYS use the REQUEST DATE extracted in step 1 for every date-dependent
+            call - never today's real-world date or a guessed date.
 
             Our paper supply catalog (use these EXACT item names):
             {CATALOG_TEXT}
