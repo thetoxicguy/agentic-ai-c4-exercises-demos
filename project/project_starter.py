@@ -691,6 +691,30 @@ def reorder_stock(item_name: str, quantity: int, unit_price: float, order_date: 
 
 # Tools for quoting agent
 
+@tool
+def find_similar_quotes(search_terms: List[str], limit: int = 5) -> str:
+    """Look up historical quotes that match the given search terms.
+
+    Useful for pricing a new request consistently with past quotes for similar
+    job types, order sizes, or event types.
+
+    Args:
+        search_terms: Keywords to match against past customer requests and quote explanations.
+        limit: Maximum number of historical quotes to return.
+
+    Returns:
+        A formatted summary of matching historical quotes, or a message if none are found.
+    """
+    quotes = search_quote_history(search_terms, limit)
+    if not quotes:
+        return "No similar historical quotes found."
+    lines = [
+        f"- ${q['total_amount']} ({q['job_type']}, {q['order_size']}, {q['event_type']}): "
+        f"{q['quote_explanation']}"
+        for q in quotes
+    ]
+    return "Similar past quotes:\n" + "\n".join(lines)
+
 
 # Tools for ordering agent
 
