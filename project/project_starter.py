@@ -1083,16 +1083,77 @@ class Orchestrator(ToolCallingAgent):
             The final text response to send back to the customer.
         """
         try:
-            return self.run(request_text)
+            raw_response = self.run(request_text)
+            return sanitize_customer_response(raw_response)
         except Exception as exc:
             print(f"Error handling request: {exc}")
             return (
-                "We're sorry, we were unable to process your request due to an "
-                "internal issue. Please contact us directly so we can assist you."
+                "We're sorry, we could not complete this request right now. "
+                "Please contact us so we can help with alternatives."
             )
 
 
 orchestrator = Orchestrator(model)
+
+
+def sanitize_customer_response(response: str) -> str:
+    """Remove internal financial details from customer-facing text.
+
+    Acts as a deterministic safety net behind the agents' own prompt
+    instructions not to reveal cash balances or profit margins - those
+    instructions are not always followed reliably by the model, so this
+    catches what slips through before anything reaches the customer.
+
+    Args:
+        response: The raw text the Orchestrator produced.
+
+    Returns:
+        The same text with internal financial details redacted.
+    """
+    replacements = [
+        (
+            r"(?i)the company has a cash balance of \$[\d,]+(?:\.\d{2})?",
+            "we are unable to restock in time",
+        ),
+        (
+            r"(?i)(?:an?\s+)?(?:current |our )?cash balance(?: is| of)? \$[\d,]+(?:\.\d{2})?",
+            "limited restocking capacity",
+        ),
+        (
+            r"(?i)insufficient cash balance",
+            "insufficient restocking capacity",
+        ),
+        (
+            r"(?i)no available cash balance",
+            "no available restocking capacity",
+        ),
+        (
+            r"(?i)(?:an?\s+)?\bcash balance\b",
+            "limited restocking capacity",
+        ),
+        (
+            r"(?i)funds for reorder(?:ing)?",
+            "capacity for reordering",
+        ),
+        (
+            r"(?i)(?:an?\s+)?\bfunds\b",
+            "limited restocking capacity",
+        ),
+        (
+            r"(?i)profit margins?",
+            "our internal pricing",
+        ),
+        (
+            r"(?i)internal issue",
+            "processing issue",
+        ),
+    ]
+
+    cleaned = response
+    for pattern, replacement in replacements:
+        cleaned = re.sub(pattern, replacement, cleaned)
+
+    return cleaned
 
 
 def call_your_multi_agent_system(request_text: str) -> str:
