@@ -849,12 +849,19 @@ def finalize_sale(item_name: str, quantity: int, total_price: float, sale_date: 
 
     Returns:
         A confirmation message including the new transaction ID, or an error if
-        item_name is not an exact catalog name.
+        item_name is not an exact catalog name or stock is insufficient.
     """
     if item_name not in CATALOG_PRICES:
         return (
             f"Cannot finalize sale of '{item_name}': not an exact catalog item "
             "name. Use match_catalog_item to find the correct name first."
+        )
+    stock = int(get_stock_level(item_name, sale_date).iloc[0]["current_stock"])
+    if quantity > stock:
+        return (
+            f"Cannot finalize sale of {quantity} units of {item_name}: only "
+            f"{stock} units in stock as of {sale_date}. Re-check stock with "
+            "check_stock_for_order before finalizing."
         )
     transaction_id = create_transaction(item_name, "sales", quantity, total_price, sale_date)
     return f"Sale recorded (transaction #{transaction_id}): {quantity} units of {item_name} for ${total_price:.2f}."
